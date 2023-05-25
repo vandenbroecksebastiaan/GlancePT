@@ -11,18 +11,16 @@ import re
 import time
 from multiprocessing import Pool
 import numpy as np
+import torch
 import nltk
 import os
 from tqdm import tqdm
+import argparse
 
-from langchain import OpenAI
-from langchain.chains.summarize import load_summarize_chain
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.docstore.document import Document
 import openai
+from sentence_transformers import SentenceTransformer, util
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
-from sentence_transformers import SentenceTransformer, util
 
 from email_client import EmailClient
 
@@ -52,7 +50,7 @@ class Scraper:
         papers = []
         while len(papers) < self.n_papers:
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(0.1)
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             papers = soup.find_all('a', href=True)
             papers = [i["href"] for i in papers]
@@ -81,6 +79,7 @@ class Scraper:
 
 class Paper:
     def __init__(self, link):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.link = link
         paper_info = requests.get(f"https://paperswithcode.com/api/v1/papers/{self.link}")
         paper_info = paper_info.json()
@@ -92,6 +91,9 @@ class Paper:
         self.authors = paper_info["authors"]
         self.published = paper_info["published"]
         
+        self.process_abstract()
+        self.get_full_text()
+        
     def get_full_text(self):
         pdf_file = requests.get(self.url_pdf)
         reader = PyPDF2.PdfReader(BytesIO(pdf_file.content))
@@ -102,12 +104,20 @@ class Paper:
                            .replace("\t", "") \
                            .encode("ascii", "ignore") \
                            .decode("ascii")
+
+        # Remove sentences from the text that are in the abstract
+        for line in self.abstract:
+            if line.lower() in pdf_text.lower():
+                start_index = pdf_text.lower().find(line.lower())
+                end_index = start_index + len(line)
+                pdf_text = pdf_text[:start_index] + pdf_text[end_index:]
         
         # Make sure that "references" is only mentioned once and delete the
         # references section
         if pdf_text.lower().count("references") < 2: print("MULTPLE REFERENCES")
-        references_index = pdf_text.lower().rfind("references")
-        pdf_text = pdf_text[:references_index]
+        if "references" in pdf_text.lower():
+            references_index = pdf_text.lower().rfind("references")
+            pdf_text = pdf_text[:references_index]
 
         # We do this to improve the quality of sentence splitting
         pdf_text = re.sub(r'\[[^\]]*\]', '', pdf_text)
@@ -121,29 +131,24 @@ class Paper:
         pdf_text = re.sub(r'we ', 'the authors ', pdf_text)
         pdf_text = re.sub(r'I ', 'the author ', pdf_text)
         
-        # Remove non-english words, we do this to remove names of authors and
-        # places, but it may also remove words that are not in the vocab
-        # and are important for the paper
-
         sentences = nltk.tokenize.sent_tokenize(pdf_text)
-        
         # Merge short sentences with the previous sentence
-        for i in range(len(sentences)):
-            if len(sentences[i]) < 20:
-                sentences[i-1] += sentences[i]
-                sentences[i] = ""
+        for idx in range(1, len(sentences)):
+            if len(sentences[idx]) < 20:
+                sentences[idx-1] += sentences[idx]
+                sentences[idx] = ""
         sentences = [i for i in sentences if i != ""]
         sentences = [i for i in sentences if "keywords" not in i.lower()]
         sentences = [i for i in sentences if "arxiv" not in i.lower()]
-        
+        # Remove all sentences with a link in them
+        sentences = [i for i in sentences if not bool(re.search(r'https?://\S+|www\.\S+', i))]
         # Delete short sentences
         sentences = [i for i in sentences if len(i) > 5]
         # Delete the first sentence, since it contains the title and names
         # of the authors and is not very informative
         sentences = sentences[1:]
-        
         # Make sentences into a non-overlapping sliding window of 3 elements each
-        sentences = ["".join(sentences[i:i+3]) for i in range(0, len(sentences), 3)]
+        # sentences = [" ".join(sentences[i:i+3]) for i in range(0, len(sentences), 3)]
         
         n_words = len("".join(pdf_text).split(" "))
         n_chars = len("".join(pdf_text))
@@ -153,33 +158,54 @@ class Paper:
         self.pdf_text = pdf_text
         self.sentences = sentences
         
+        
+    def process_abstract(self):
+        self.abstract = re.sub(r'\[[^\]]*\]', '', self.abstract)
+        self.abstract = re.sub(r'e\.g\.', 'for example', self.abstract)
+        self.abstract = re.sub(r'i\.e\.', 'for example', self.abstract)
+        self.abstract = re.sub(r'i\.i\.d\.', 'independent and identically distributed', self.abstract)
+        self.abstract = re.sub(r'etc\.', 'etc', self.abstract)
+        self.abstract = re.sub(r'rst', '', self.abstract)
+        self.abstract = re.sub(r'- ', '', self.abstract)
+        # TODO: move this to one of the last steps
+        # self.abstract = re.sub(r' We ', ' The authors ', self.abstract)
+        # self.abstract = re.sub(r' we ', ' the authors ', self.abstract)
+        # self.abstract = re.sub(r' I ', ' the author ', self.abstract)
+        self.abstract = nltk.tokenize.sent_tokenize(self.abstract)
+        # Remove all sentences that have a link in them
+        self.abstract = [i for i in self.abstract if not bool(re.search(r'https?://\S+|www\.\S+', i))]
+        
     def get_embeddings(self, n_sentences=5):
-        model = SentenceTransformer('all-mpnet-base-v2', device="cuda")
-        embeddings = model.encode(self.sentences)
-        self.embeddings = np.vstack(embeddings)
+        model = SentenceTransformer('all-mpnet-base-v2', device=self.device)
+        text_embeddings = model.encode(self.sentences)
+        self.text_embeddings = np.vstack(text_embeddings)
+        abstract_embeddings = model.encode(self.abstract)
+        self.abstract_embeddings = np.vstack(abstract_embeddings)
 
-        query = self.title + self.abstract \
-                + "What is the most important sentence? What are the new findings?" 
-        query_embedding = model.encode(query)
-        
-        sentence_dot_scores = []
-        for idx, embedding in enumerate(self.embeddings):
-            dot_score = util.dot_score(query_embedding, embedding)
-            sentence_dot_scores.append((self.sentences[idx], dot_score))
-        
-        # Sort sentences by dot scores
-        sentence_dot_scores = sorted(sentence_dot_scores, key=lambda x: x[1],
-                                     reverse=True)
-        
-        for i, j in sentence_dot_scores[:n_sentences]: print(i)
-        
-        self.most_important_sentences = [i[0] for i in sentence_dot_scores[:n_sentences]]
+        self.most_important_sentences = []
+        for abstract_embedding in self.abstract_embeddings:
+            sentence_dot_scores = []
+            for idx, text_embedding in enumerate(self.text_embeddings):
+                if idx==len(self.text_embeddings)-1: next_idx = idx
+                else: next_idx = idx + 1
+                dot_score = util.cos_sim(abstract_embedding, text_embedding)
+                sentence_dot_scores.append((self.sentences[idx]+self.sentences[next_idx], dot_score))
+                sentence_dot_scores = sorted(sentence_dot_scores, key=lambda x: x[1],
+                                             reverse=True)
+            
+            self.most_important_sentences.extend([i[0] for i in sentence_dot_scores[:n_sentences]])
 
     def get_summary(self):
         prompt = """
 You have been tasked with providing an overview of the following text.
-Start the overview by the passive form of what the text is about.
-For example, "A new method called ... was proposed ...".
+Provide a general overview and also try to answer the following questions:
+What are the new findings? What problem does the proposed method solve? \
+What can the new method be used for in the future? \
+What are the limitations?
+Try to end the paper with a take-home message or topic sentence.
+Start the summary with the main topic of the text. \
+For example, "FastComposer is a new method for text-to-image generation without fine-tuning ...".
+Use the third person when referring to the authors of the paper.
 
 """
         for i in self.most_important_sentences: prompt += i + "\n"
@@ -205,34 +231,34 @@ For example, "A new method called ... was proposed ...".
             print("-"*100)
             for j in i:
                 print(self.sentences[j])
-        
-    def summarize(self):
-        text_splitter = CharacterTextSplitter(
-            chunk_size=2000, chunk_overlap=0, separator=" "
-        )
-        texts = text_splitter.split_text(self.pdf_text)
-        print("+++", len(texts))
-        for i in texts: print("---", len(i.split(" ")))
-        docs = [Document(page_content=t) for t in texts]
-        llm = OpenAI(temperature=0, batch_size=5, model="curie")
-        chain = load_summarize_chain(llm, chain_type="map_reduce")
-        self.summary = chain.run(docs)
-        print(">>> Summary:", self.summary)
     """
         
     def _gpt_completion_call(self, prompt):
-        completion = openai.ChatCompletion.create(
-          model="gpt-3.5-turbo",
-          messages=[
-            {"role": "user", "content": prompt}
-          ]
-        )
-        return completion["choices"][0]["message"]["content"]
+        for idx in range(10):
+            try: 
+                completion = openai.ChatCompletion.create(
+                  model="gpt-3.5-turbo",
+                  messages=[
+                    {"role": "user", "content": prompt}
+                  ]
+                )
+                return completion["choices"][0]["message"]["content"]
+            except openai.error.RateLimitError:
+                print(f"Error in GPT-3 call: Rate limit exceeded. Trying again... {idx}")
         
 
 def main():
+    # Get vargs
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_papers", type=int, default=4)
+    parser.add_argument("--email", type=str, required=True)
+    args = parser.parse_args()
+
+    n_papers = args.n_papers
+    email = args.email
+
     # Scrape the site
-    scraper = Scraper(n_papers=2)
+    scraper = Scraper(n_papers=n_papers)
     print(">>> len scraper:", len(scraper.paper_links))
 
     # Process the papers
@@ -240,14 +266,14 @@ def main():
     paper_summaries = []
     for link in tqdm(scraper, desc="Processing papers", total=len(scraper)):
         paper = Paper(link)
-        paper.get_full_text()
-        paper.get_embeddings()
+        paper.get_embeddings(n_sentences=3)
         paper.get_summary()
+        print(paper.summary)
         paper_titles.append(paper.title); paper_summaries.append(paper.summary);
     
     # Send the mail
     email_sender = EmailClient()
     email_sender.make_email(paper_titles, paper_summaries)
-    email_sender.send_email("van.den.broeck.sebastiaan@gmail.com")
+    email_sender.send_email(email)
 
 if __name__ == "__main__": main()
