@@ -12,12 +12,14 @@ import time
 import numpy as np
 import torch
 import nltk
+from typing import List
 import os
 from tqdm import tqdm
 import argparse
 import umap
 import matplotlib.pyplot as plt
 from multiprocessing import Pool
+import textwrap
 
 import openai
 from sentence_transformers import SentenceTransformer, util
@@ -87,7 +89,7 @@ class Paper:
         paper_info = paper_info.json()
 
         if "detail" in paper_info.keys():
-            raise PaperNotFoundException(paper.link)
+            raise PaperNotFoundException(self.link)
 
         self.id = paper_info["id"]
         self.arxiv_id = paper_info["arxiv_id"]
@@ -120,7 +122,6 @@ class Paper:
         
         # Make sure that "references" is only mentioned once and delete the
         # references section
-        if pdf_text.lower().count("references") < 2: print("MULTPLE REFERENCES")
         if "references" in pdf_text.lower():
             references_index = pdf_text.lower().rfind("references")
             pdf_text = pdf_text[:references_index]
@@ -182,11 +183,13 @@ class Paper:
         self.abstract = [i for i in self.abstract if not bool(re.search(r'https?://\S+|www\.\S+', i))]
         
     def get_embeddings(self, n_sentences=5):
+        # model = SentenceTransformer('all-mpnet-base-v2', device=self.device)
         model = SentenceTransformer('all-mpnet-base-v2', device=self.device)
         text_embeddings = model.encode(self.sentences)
         self.text_embeddings = np.vstack(text_embeddings)
         abstract_embeddings = model.encode(self.abstract)
         self.abstract_embeddings = np.vstack(abstract_embeddings)
+        del model; torch.cuda.empty_cache();
 
         self.most_important_sentences = []
         for abstract_embedding in self.abstract_embeddings:
@@ -245,9 +248,7 @@ Use the third person when referring to the authors of the paper.
             try: 
                 completion = openai.ChatCompletion.create(
                   model="gpt-3.5-turbo",
-                  messages=[
-                    {"role": "user", "content": prompt}
-                  ]
+                  messages=[{"role": "user", "content": prompt}]
                 )
                 return completion["choices"][0]["message"]["content"]
             except openai.error.RateLimitError:
@@ -261,32 +262,93 @@ def process_paper(link):
         paper = Paper(link)
         paper.get_embeddings(n_sentences=3)
         paper.get_summary()
-        paper.visualize_embedding(n_neighbors=5)
-        return paper.title, paper.summary
+        # paper.visualize_embedding(n_neighbors=5)
+        return paper
     except PaperNotFoundException as e:
         print(f"Oh no an exception >:( with paper {str(e)}")
+        return None
+              
+def make_abstract_visualization(abstracts: List, paper_titles: List):
+    abstract_lengths = [len(i) for i in abstracts]
+    abstracts = [i for j in abstracts for i in j]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer('all-mpnet-base-v2', device=device)
+    embeddings = model.encode(abstracts)
+    red_embeddings = umap.UMAP(n_neighbors=10).fit_transform(embeddings)
+
+    # Generate a colormap based on paper titles
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+              "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan"]
+    while len(colors) < len(set(paper_titles)):
+        colors += colors
+
+    title_to_color = {}
+    for idx, title in enumerate(list(set(paper_titles))):
+        title_to_color[title] = colors[idx]
+              
+    colors = [[title_to_color[i]]*length for i, length in zip(paper_titles, abstract_lengths)]
+    colors = [i for j in colors for i in j]
+    labels = [[title]*length for title, length in zip(paper_titles, abstract_lengths)]
+    labels = [i for j in labels for i in j]
+    labels = [i.split(":")[0] for i in labels]
+              
+    # Only keep the first label per paper, since we want to avoid duplicate
+    # elements in the legend
+    unique_labels = []
+    for label in labels:
+        if label not in unique_labels:
+            unique_labels.append(label)
+        else:
+            unique_labels.append('')
+    labels = unique_labels
+
+    # Add a linebreak to the labels if they are longer than 30 characters
+    wrapped_labels = [textwrap.fill(label, 30) for label in labels]
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    # The loop is necessary to get the legend to work
+    for (x, y), color, label in zip(red_embeddings, colors, wrapped_labels):
+        plt.scatter(x, y, c=color, label=label, alpha=0.8)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.set_title("")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    plt.savefig(f"visualizations/abstracts.png", dpi=300, bbox_inches='tight')
 
 def main():
     # Get vargs
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_papers", type=int, default=4)
     parser.add_argument("--email", type=str, required=True)
+    parser.add_argument("--n_processes", type=int, default=8)
     args = parser.parse_args()
 
     n_papers = args.n_papers
     email = args.email
+    n_processes = args.n_processes
 
     # Scrape the site and process the papers
     scraper = Scraper(n_papers=n_papers)
-    with Pool(10) as pool: 
-        results = pool.map(process_paper, list(scraper))
+    with Pool(n_processes) as pool: 
+        papers = pool.map(process_paper, list(scraper))
+        
+    # These are the papers for which the API did not work
+    papers = [i for i in papers if i is not None]
+    paper_titles = [i.title for i in papers]
+    paper_summaries = [i.summary for i in papers]
+    abstracts = [i.abstract for i in papers]
     
-    paper_titles = [i[0] for i in results]
-    paper_summaries = [i[1] for i in results]
+    print("here")
+    make_abstract_visualization(abstracts, paper_titles)
     
     # Send the mail
     email_sender = EmailClient()
-    email_sender.make_email(paper_titles, paper_summaries)
-    email_sender.send_email(email)
+    email_sender.make_email(paper_titles, paper_summaries, email)
+    email_sender.send_email()
 
 if __name__ == "__main__": main()
