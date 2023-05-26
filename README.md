@@ -71,7 +71,11 @@ export OPENAI_API_KEY=YOUR_API_KEY_HERE
 You can set up a Cron job to run this script daily or whenever you would like.
 Speed is not the main concern here, but since the embeddings are generated
 locally you do need to have some RAM. I believe 6 gigs should be plenty. Having
-a GPU in your system would be ideal, but is not necessary.
+a GPU in your system would be ideal, but is not necessary. Another thing to
+take into account is that I use a multiprocessing pool to speed up this
+process a little bit. Which means that the embedding model is going to be
+loaded a certain number of times. If you don't have a lot of (V)RAM available,
+you may choose to lower the number of processes in the pool.
 
 ## Why don't you directly feed the whole text to GPT-3.5 or use LangChain?
 

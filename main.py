@@ -9,13 +9,15 @@ import PyPDF2
 from io import BytesIO
 import re
 import time
-from multiprocessing import Pool
 import numpy as np
 import torch
 import nltk
 import os
 from tqdm import tqdm
 import argparse
+import umap
+import matplotlib.pyplot as plt
+from multiprocessing import Pool
 
 import openai
 from sentence_transformers import SentenceTransformer, util
@@ -83,6 +85,10 @@ class Paper:
         self.link = link
         paper_info = requests.get(f"https://paperswithcode.com/api/v1/papers/{self.link}")
         paper_info = paper_info.json()
+
+        if "detail" in paper_info.keys():
+            raise PaperNotFoundException(paper.link)
+
         self.id = paper_info["id"]
         self.arxiv_id = paper_info["arxiv_id"]
         self.url_pdf = paper_info["url_pdf"]
@@ -211,11 +217,10 @@ Use the third person when referring to the authors of the paper.
         for i in self.most_important_sentences: prompt += i + "\n"
         self.summary = self._gpt_completion_call(prompt)
 
-    """
     def get_clusters(self, n_clusters=1):
         from sklearn.cluster import KMeans
         kmeans = KMeans(n_clusters=n_clusters, random_state=1337, n_init="auto") \
-                     .fit(self.embeddings)
+                     .fit(self.text_embeddings)
         self.clusters = kmeans.labels_
         self.cluster_centers = kmeans.cluster_centers_
     
@@ -223,15 +228,17 @@ Use the third person when referring to the authors of the paper.
         # Get the closest sentence to each cluster center
         closest_sentences = []
         for i in range(len(self.cluster_centers)):
-            distances = np.linalg.norm(self.embeddings - self.cluster_centers[i], axis=1)
-            print(np.argsort(distances)[:top])
+            distances = np.linalg.norm(self.text_embeddings - self.cluster_centers[i], axis=1)
             closest_sentences.append(np.argsort(distances)[:top])
-            
-        for i in closest_sentences:
-            print("-"*100)
-            for j in i:
-                print(self.sentences[j])
-    """
+                
+    def visualize_embedding(self, n_neighbors=10):
+        red_embeddings = umap.UMAP(n_neighbors=n_neighbors) \
+                             .fit_transform(self.text_embeddings)
+        plt.figure(figsize=(10,10))
+        plt.scatter(red_embeddings[:,0], red_embeddings[:,1],
+                    c=np.arange(red_embeddings.shape[0]), cmap="viridis")
+        plt.colorbar()
+        plt.savefig(f"visualizations/{self.title}.png", dpi=300, bbox_inches='tight')
         
     def _gpt_completion_call(self, prompt):
         for idx in range(10):
@@ -245,7 +252,19 @@ Use the third person when referring to the authors of the paper.
                 return completion["choices"][0]["message"]["content"]
             except openai.error.RateLimitError:
                 print(f"Error in GPT-3 call: Rate limit exceeded. Trying again... {idx}")
-        
+                
+class PaperNotFoundException(Exception):
+    pass
+
+def process_paper(link):
+    try:
+        paper = Paper(link)
+        paper.get_embeddings(n_sentences=3)
+        paper.get_summary()
+        paper.visualize_embedding(n_neighbors=5)
+        return paper.title, paper.summary
+    except PaperNotFoundException as e:
+        print(f"Oh no an exception >:( with paper {str(e)}")
 
 def main():
     # Get vargs
@@ -257,19 +276,13 @@ def main():
     n_papers = args.n_papers
     email = args.email
 
-    # Scrape the site
+    # Scrape the site and process the papers
     scraper = Scraper(n_papers=n_papers)
-    print(">>> len scraper:", len(scraper.paper_links))
-
-    # Process the papers
-    paper_titles = []
-    paper_summaries = []
-    for link in tqdm(scraper, desc="Processing papers", total=len(scraper)):
-        paper = Paper(link)
-        paper.get_embeddings(n_sentences=3)
-        paper.get_summary()
-        print(paper.summary)
-        paper_titles.append(paper.title); paper_summaries.append(paper.summary);
+    with Pool(10) as pool: 
+        results = pool.map(process_paper, list(scraper))
+    
+    paper_titles = [i[0] for i in results]
+    paper_summaries = [i[1] for i in results]
     
     # Send the mail
     email_sender = EmailClient()
