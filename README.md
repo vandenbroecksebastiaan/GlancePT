@@ -85,4 +85,5 @@ informative sentences from the article.
 
 ## Example: this is what the mail looks like on 26/05/2023
 
-<img width="855" alt="Screenshot 2023-05-26 at 19 32 29" src="https://github.com/vandenbroecksebastiaan/GlancePT/assets/101555259/87ffabfe-0c8c-45ca-a0d6-d7a914261444">
+<img width="1212" alt="Screenshot 2023-05-27 at 14 07 09" src="https://github.com/vandenbroecksebastiaan/GlancePT/assets/101555259/4c7d0f6a-1bff-44e9-9258-4d50c3000137">
+
