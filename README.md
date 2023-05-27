@@ -83,7 +83,7 @@ I recently took a look at the Usage section of my account on OpenAI and things
 are not looking good. To restrict token usage, I only want to use the most
 informative sentences from the article.
 
-## Example: this is what the mail looks like on 26/05/2023
+## Example: this is what such a mail could look like
 
 <img width="1212" alt="Screenshot 2023-05-27 at 14 07 09" src="https://github.com/vandenbroecksebastiaan/GlancePT/assets/101555259/4c7d0f6a-1bff-44e9-9258-4d50c3000137">
 
