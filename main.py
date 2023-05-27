@@ -14,12 +14,12 @@ import torch
 import nltk
 from typing import List
 import os
-from tqdm import tqdm
 import argparse
 import umap
 import matplotlib.pyplot as plt
 from multiprocessing import Pool
 import textwrap
+from sklearn.cluster import KMeans
 
 import openai
 from sentence_transformers import SentenceTransformer, util
@@ -101,6 +101,18 @@ class Paper:
         
         self.process_abstract()
         self.get_full_text()
+
+    def _gpt_completion_call(self, prompt):
+        for idx in range(10):
+            try: 
+                completion = openai.ChatCompletion.create(
+                  model="gpt-3.5-turbo",
+                  messages=[{"role": "user", "content": prompt}]
+                )
+                return completion["choices"][0]["message"]["content"]
+            except openai.error.RateLimitError:
+                print(f"Error in GPT-3 call: Rate limit exceeded. "\
+                      f"Trying again... {idx}")
         
     def get_full_text(self):
         pdf_file = requests.get(self.url_pdf)
@@ -225,7 +237,7 @@ Use the third person when referring to the authors of the paper.
         kmeans = KMeans(n_clusters=n_clusters, random_state=1337, n_init="auto") \
                      .fit(self.text_embeddings)
         self.clusters = kmeans.labels_
-        self.cluster_centers = kmeans.cluster_centers_
+        self.cluster_centers = kmeans.cluster_centers_   # use this for annotate
     
     def get_closest_sentences(self, top=10):
         # Get the closest sentence to each cluster center
@@ -243,6 +255,25 @@ Use the third person when referring to the authors of the paper.
         plt.colorbar()
         plt.savefig(f"visualizations/{self.title}.png", dpi=300, bbox_inches='tight')
         
+
+class PaperNotFoundException(Exception):
+    pass
+              
+
+class AbstractVisualization:
+    def __init__(self, abstracts: List, paper_titles: List, n_papers: int):
+        self.abstracts = abstracts
+        self.abstract_lengths = [len(i) for i in self.abstracts]
+        self.paper_titles = paper_titles
+        self.n_papers = n_papers
+        if self.n_papers > 15: self.n_clusters = self.n_papers // 4
+        elif self.n_papers > 10: self.n_clusters = self.n_papers // 3
+        else: self.n_clusters = self.n_papers // 2
+        
+        self._get_embeddings()
+        self._cluster_abstracts()
+        self._get_cluster_descriptions()
+
     def _gpt_completion_call(self, prompt):
         for idx in range(10):
             try: 
@@ -252,10 +283,151 @@ Use the third person when referring to the authors of the paper.
                 )
                 return completion["choices"][0]["message"]["content"]
             except openai.error.RateLimitError:
-                print(f"Error in GPT-3 call: Rate limit exceeded. Trying again... {idx}")
+                print(f"Error in GPT-3 call: Rate limit exceeded. "\
+                      f"Trying again... {idx}")
                 
-class PaperNotFoundException(Exception):
-    pass
+    def _get_embeddings(self):
+        """Generates embeddings for each sentence in the abstract using
+        SentenceTransformer. Then, reduces the dimensionality of the
+        embeddings using UMAP."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer('all-mpnet-base-v2', device=device)
+        abstracts = [i for j in self.abstracts for i in j]
+        embeddings = model.encode(abstracts)
+        red_embeddings = umap.UMAP(n_neighbors=10).fit_transform(embeddings)
+        del model; torch.cuda.empty_cache();
+        self.red_embeddings = red_embeddings
+        self.embeddings = embeddings
+
+    def _cluster_abstracts(self):
+        """Clusters the abstracts using KMeans."""
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=1337)
+        kmeans = kmeans.fit(self.red_embeddings)
+        clusters = kmeans.labels_
+        self.cluster_centers = kmeans.cluster_centers_
+
+        # Unnest the abstracts
+        abstracts = [i for j in self.abstracts for i in j]
+
+        # Create a mapping from cluster_id to abstracts
+        cluster_to_abstracts = {}
+        for idx, cluster in enumerate(clusters):
+            if cluster not in cluster_to_abstracts:
+                cluster_to_abstracts[cluster] = []
+            cluster_to_abstracts[cluster].append(abstracts[idx])
+
+        # Join all the sentences of the abstracts in each cluster
+        cluster_to_abstracts = {k: " ".join(v) for k, v in
+                                cluster_to_abstracts.items()}
+        self.cluster_to_abstracts = cluster_to_abstracts
+        
+        # Create a mapping from cluster_id to cluster center
+        self.cluster_to_centroid = {k: v.tolist() for k, v in
+                                    enumerate(self.cluster_centers)}
+
+    def _get_cluster_descriptions(self,):
+        """Generates a one or two word description of each cluster using
+           GPT-3."""
+        cluster_descriptions = []
+        for cluster_id, abstract in self.cluster_to_abstracts.items():
+            response = ". "*10
+            prompt = f"""
+You have been tasked with finding the subfield of machine learning the \
+following text is about in one or two words.
+To that end, you are encouraged to use field-specific terminology.
+EXAMPLE RESPONSE: Quantization
+EXAMPLE RESPONSE: Image recognition
+EXAMPLE RESPONSE: Translation
+EXAMPLE RESPONSE: Training procedure
+EXAMPLE RESPONSE: Dataset
+EXAMPLE RESPONSE: Natural language processing
+EXAMPLE RESPONSE: Reinforcement learning
+EXAMPLE RESPONSE: Generative adversarial networks
+EXAMPLE RESPONSE: Optimization
+
+The abstracts:
+{abstract}
+            """
+            # Repeat the GPT-3 call in the case that the response is too long
+            while len(response.split()) > 4:
+                if response != ", , , ,": print(f"GPT-3 call for cluster {cluster_id} due to response {response}")
+                response = self._gpt_completion_call(prompt)
+            cluster_descriptions.append((cluster_id, response))
+
+        # Create a map from cluster center (coordinates) to cluster description
+        self.cluster_descriptions = [(self.cluster_to_centroid[i[0]], i[1])
+                                     for i in cluster_descriptions]
+
+    def _prepare_styles(self):
+        """Prepare the styles of the markets for the plot."""
+        # Take every posisble combination of the following colors and markers
+        colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+                  "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan"]
+        markers = ["o", "+", "*", "x"]
+        styles = []
+        for marker in markers:
+            for color in colors:
+                styles.append((color, marker))
+
+        # Repeat the styles until we have enough (if there are more than 40
+        # papers)
+        while len(styles) < len(set(self.paper_titles)):
+            styles += styles
+
+        # Create map from paper title to style (color, marker)
+        title_to_style = {}
+        for idx, title in enumerate(list(set(self.paper_titles))):
+            title_to_style[title] = styles[idx]
+            
+        # Create a list of styles that can be used for plotting
+        styles = [[title_to_style[i]] * length for i, length in
+                  zip(self.paper_titles, self.abstract_lengths)]
+        styles = [i for j in styles for i in j]
+        
+        return styles
+    
+    def _prepare_labels(self):
+        """Prepares the labesl for the plot."""
+        # Create a list of labels that can be used for plotting
+        labels = [[title] * length for title, length in zip(self.paper_titles, self.abstract_lengths)]
+        labels = [i for j in labels for i in j]
+        labels = [i.split(":")[0] for i in labels]
+
+        # We do this to avoid having duplicate labels
+        unique_labels = []
+        for label in labels:
+            if label not in unique_labels:
+                unique_labels.append(label)
+            else:
+                unique_labels.append('')
+        wrapped_labels = [textwrap.fill(label, 30) for label in unique_labels]
+
+        return wrapped_labels
+
+    def visualize_abstracts(self):
+        """Makes a visualization of the reduced embeddings of the abstracts."""
+        styles = self._prepare_styles()
+        wrapped_labels = self._prepare_labels()
+
+        # Plot the datapoints
+        fig, ax = plt.subplots(figsize=(7, 7))
+        for (x, y), (color, marker), label in zip(self.red_embeddings, styles, wrapped_labels):
+            plt.scatter(x, y, c=color, marker=marker, label=label, alpha=0.8)
+
+        # Show the cluster descriptions
+        for (x, y), description in self.cluster_descriptions:
+            plt.text(x, y, description, fontsize=12, ha='center', va='center', alpha=0.5)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_visible(False)
+        ax.spines['left'].set_visible(False)
+        ax.set_title("")
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        plt.savefig(f"visualizations/abstracts.png", dpi=300, bbox_inches='tight')
+
 
 def process_paper(link):
     try:
@@ -267,58 +439,7 @@ def process_paper(link):
     except PaperNotFoundException as e:
         print(f"Oh no an exception >:( with paper {str(e)}")
         return None
-              
-def make_abstract_visualization(abstracts: List, paper_titles: List):
-    abstract_lengths = [len(i) for i in abstracts]
-    abstracts = [i for j in abstracts for i in j]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SentenceTransformer('all-mpnet-base-v2', device=device)
-    embeddings = model.encode(abstracts)
-    red_embeddings = umap.UMAP(n_neighbors=10).fit_transform(embeddings)
 
-    # Generate a colormap based on paper titles
-    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
-              "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan"]
-    while len(colors) < len(set(paper_titles)):
-        colors += colors
-
-    title_to_color = {}
-    for idx, title in enumerate(list(set(paper_titles))):
-        title_to_color[title] = colors[idx]
-              
-    colors = [[title_to_color[i]]*length for i, length in zip(paper_titles, abstract_lengths)]
-    colors = [i for j in colors for i in j]
-    labels = [[title]*length for title, length in zip(paper_titles, abstract_lengths)]
-    labels = [i for j in labels for i in j]
-    labels = [i.split(":")[0] for i in labels]
-              
-    # Only keep the first label per paper, since we want to avoid duplicate
-    # elements in the legend
-    unique_labels = []
-    for label in labels:
-        if label not in unique_labels:
-            unique_labels.append(label)
-        else:
-            unique_labels.append('')
-    labels = unique_labels
-
-    # Add a linebreak to the labels if they are longer than 30 characters
-    wrapped_labels = [textwrap.fill(label, 30) for label in labels]
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-    # The loop is necessary to get the legend to work
-    for (x, y), color, label in zip(red_embeddings, colors, wrapped_labels):
-        plt.scatter(x, y, c=color, label=label, alpha=0.8)
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['bottom'].set_visible(False)
-    ax.spines['left'].set_visible(False)
-    ax.set_title("")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-    plt.savefig(f"visualizations/abstracts.png", dpi=300, bbox_inches='tight')
 
 def main():
     # Get vargs
@@ -337,14 +458,13 @@ def main():
     with Pool(n_processes) as pool: 
         papers = pool.map(process_paper, list(scraper))
         
-    # These are the papers for which the API did not work
+    # Exclude the papers that weren't found using the API
     papers = [i for i in papers if i is not None]
     paper_titles = [i.title for i in papers]
     paper_summaries = [i.summary for i in papers]
     abstracts = [i.abstract for i in papers]
     
-    print("here")
-    make_abstract_visualization(abstracts, paper_titles)
+    AbstractVisualization(abstracts, paper_titles, n_papers).visualize_abstracts()
     
     # Send the mail
     email_sender = EmailClient()

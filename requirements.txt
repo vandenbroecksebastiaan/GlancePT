@@ -6,6 +6,7 @@ async-timeout==4.0.2
 attrs==23.1.0
 backoff==2.2.1
 beautifulsoup4==4.12.2
+cattrs==22.2.0
 certifi==2023.5.7
 charset-normalizer==3.1.0
 chromadb==0.3.25
@@ -16,6 +17,7 @@ coloredlogs==15.0.1
 contourpy==1.0.7
 cycler==0.11.0
 dataclasses-json==0.5.7
+docstring-to-markdown==0.12
 duckdb==0.8.0
 exceptiongroup==1.1.1
 fastapi==0.95.2
@@ -31,12 +33,15 @@ httptools==0.5.0
 huggingface-hub==0.14.1
 humanfriendly==10.0
 idna==3.4
+jedi==0.18.2
+jedi-language-server==0.40.0
 Jinja2==3.1.2
 joblib==1.2.0
 kiwisolver==1.4.4
 langchain==0.0.177
 lit==16.0.5
 llvmlite==0.40.0
+lsprotocol==2023.0.0a1
 lz4==4.3.2
 MarkupSafe==2.1.2
 marshmallow==3.19.0
@@ -69,10 +74,12 @@ outcome==1.2.0
 overrides==7.3.1
 packaging==23.1
 pandas==2.0.1
+parso==0.8.3
 Pillow==9.5.0
 posthog==3.0.1
 protobuf==4.23.1
 pydantic==1.10.7
+pygls==1.0.2
 pynndescent==0.5.10
 pyparsing==3.0.9
 PyPDF2==3.0.1
@@ -106,6 +113,7 @@ transformers==4.29.2
 trio==0.22.0
 trio-websocket==0.10.2
 triton==2.0.0
+typeguard==3.0.2
 typing-inspect==0.8.0
 typing_extensions==4.6.0
 tzdata==2023.3

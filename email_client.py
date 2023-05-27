@@ -21,7 +21,8 @@ class EmailClient:
                 break
             
         # Insert abstracts.png image
-        image_tag = '<img src="cid:abstracts" width="95%" style="margin-bottom: 15px;">'
+        # For the life of me, I cannot get this image centered
+        image_tag = '<div style="display:inline-block;text-align:justify"><img src="cid:abstracts" style="margin-bottom:15px;width:100%;height:auto;"></div>'
         html.insert(summary_idx, image_tag)
         summary_idx += 1
 
