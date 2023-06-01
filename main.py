@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from multiprocessing import Pool
 import textwrap
 from sklearn.cluster import KMeans
+import xmltodict
 
 import openai
 from sentence_transformers import SentenceTransformer, util
@@ -36,7 +37,7 @@ class Scraper:
         self.driver = self.get_driver()
         self.html = self.get_papers("https://www.paperswithcode.com")
 
-    def get_driver(self):
+    def get_driver(self) -> webdriver.Chrome:
         options = webdriver.ChromeOptions()
         options.add_argument('--headless')
         options.add_argument("--remote-debugging-port=9222") # do not delete
@@ -48,7 +49,7 @@ class Scraper:
         )
         return driver
     
-    def get_papers(self, url):
+    def get_papers(self, url: str) -> str:
         self.driver.get(url)
         # Scroll to the bottom of the page until n_papers is reached
         papers = []
@@ -98,7 +99,7 @@ class Paper:
         self.abstract = paper_info["abstract"]
         self.authors = paper_info["authors"]
         self.published = paper_info["published"]
-        
+
         self.process_abstract()
         self.get_full_text()
 
@@ -113,7 +114,19 @@ class Paper:
             except openai.error.RateLimitError:
                 print(f"Error in GPT-3 call: Rate limit exceeded. "\
                       f"Trying again... {idx}")
-        
+
+    def _embedding_call(self, prompt):
+        for idx in range(10):
+            try: 
+                response = openai.Embedding.create(
+                  model="text-embedding-ada-002",
+                  input=prompt
+                )
+                return response["data"][0]["embedding"]
+            except openai.error.RateLimitError:
+                print(f"Error in davinci call: Rate limit exceeded. "\
+                      f"Trying again... {idx}")
+
     def get_full_text(self):
         pdf_file = requests.get(self.url_pdf)
         reader = PyPDF2.PdfReader(BytesIO(pdf_file.content))
@@ -131,7 +144,7 @@ class Paper:
                 start_index = pdf_text.lower().find(line.lower())
                 end_index = start_index + len(line)
                 pdf_text = pdf_text[:start_index] + pdf_text[end_index:]
-        
+
         # Make sure that "references" is only mentioned once and delete the
         # references section
         if "references" in pdf_text.lower():
@@ -177,7 +190,6 @@ class Paper:
         self.pdf_text = pdf_text
         self.sentences = sentences
         
-        
     def process_abstract(self):
         self.abstract = re.sub(r'\[[^\]]*\]', '', self.abstract)
         self.abstract = re.sub(r'e\.g\.', 'for example', self.abstract)
@@ -193,9 +205,8 @@ class Paper:
         self.abstract = nltk.tokenize.sent_tokenize(self.abstract)
         # Remove all sentences that have a link in them
         self.abstract = [i for i in self.abstract if not bool(re.search(r'https?://\S+|www\.\S+', i))]
-        
+
     def get_embeddings(self, n_sentences=5):
-        # model = SentenceTransformer('all-mpnet-base-v2', device=self.device)
         model = SentenceTransformer('all-mpnet-base-v2', device=self.device)
         text_embeddings = model.encode(self.sentences)
         self.text_embeddings = np.vstack(text_embeddings)
@@ -267,7 +278,7 @@ class AbstractVisualization:
         self.paper_titles = paper_titles
         self.n_papers = n_papers
         if self.n_papers > 15: self.n_clusters = self.n_papers // 4
-        elif self.n_papers > 10: self.n_clusters = self.n_papers // 3
+        elif self.n_papers > 9: self.n_clusters = self.n_papers // 3
         else: self.n_clusters = self.n_papers // 2
         
         self._get_embeddings()
@@ -434,12 +445,10 @@ def process_paper(link):
         paper = Paper(link)
         paper.get_embeddings(n_sentences=3)
         paper.get_summary()
-        # paper.visualize_embedding(n_neighbors=5)
         return paper
     except PaperNotFoundException as e:
         print(f"Oh no an exception >:( with paper {str(e)}")
         return None
-
 
 def main():
     # Get vargs
@@ -470,5 +479,6 @@ def main():
     email_sender = EmailClient()
     email_sender.make_email(paper_titles, paper_summaries, email)
     email_sender.send_email()
+
 
 if __name__ == "__main__": main()
