@@ -69,7 +69,7 @@ class WebOfSciencePaper:
     def get_abstract_embedding(self, model):
         """Get the embedding of the abstract."""
         self.abstract_embedding = model.encode(self.abstract).tolist()
-        
+
     def get_text_embedding(self, model):
         """Gets one embedding for every sentence in the text."""
         self.text_embedding = []
@@ -99,7 +99,7 @@ class WebOfSciencePaper:
         )
         return driver
 
-    def _get_soup(self, driver, wait=False):
+    def _get_soup(self, driver):
         """Get html from sci-hub. Enter the search term and click the search
            button. Return the html."""
         base_url = "https://sci-hub.ru/"
@@ -133,17 +133,7 @@ class WebOfSciencePaper:
         # Construct driver, enter search term, go to next page, return html
         base_url = "https://sci-hub.ru/"
         driver = self._init_driver()
-
-        soup = None
-        wait = False
-        while type(soup) != BeautifulSoup:
-            try:
-                soup = self._get_soup(driver, wait)
-            except Exception as e:
-                print(e)
-                if soup == None:
-                    print("DDOS check")
-                    wait = True
+        soup = self._get_soup(driver)
 
         # There is no search bar on the page
         # This callback ensures that the driver can be closed
@@ -337,30 +327,39 @@ class PaperCollection:
     def process_papers(self):
         unavailable_titles = open("data/unavailable_titles.txt", "r").readlines()
         unavailable_titles = [i.replace("\n", "") for i in unavailable_titles]
-        embedding_files = [int(i.replace(".pt", "")) for i in os.listdir("data/embeddings/")]
+        embedding_files = [i.replace(".pt", "") for i in os.listdir("data/embeddings/")]
+        print("Embedding files:", embedding_files)
         # Make papers into a nested list of chunks
         processed_papers = []
+
         for paper in tqdm(self.papers, desc="Processing PDFs", leave=False):
-            # If the pdf of the paper is not available, skip it. If the embedding
-            # of the paper is already created, also skip it.
-            if (paper.title not in unavailable_titles) \
-              or (paper.index not in embedding_files):
-                try:
-                    paper.get_pdf()
-                    paper.process_pdf()
-                    processed_papers.append(paper)
-                except PaperNotFoundException:
-                    with open("data/unavailable_titles.txt", "a") as file:
-                        file.write(paper.title + "\n")
-        # Create embedding, pickle as list, check for pickle
+            paper.unavailable = True if paper.title in unavailable_titles else False
+            paper.embedding_created = True if paper.title in embedding_files else False
+            if paper.unavailable == False:
+                if paper.embedding_created == False:
+                    print(">>> Loading paper")
+                    try:
+                        paper.get_pdf()
+                        paper.process_pdf()
+                    except PaperNotFoundException:
+                        print("PaperNotFoundException")
+                        print(paper.title)
+                        with open("data/unavailable_titles.txt", "a") as file:
+                            file.write(paper.title + "\n")
+            processed_papers.append(paper)
+
         for paper in tqdm(processed_papers, desc="Creating embeddings", leave=False):
-            if paper.index not in embedding_files:
-                paper.get_text_embedding(self.model)
-                with open(f"data/embeddings/{paper.index}.pt", "wb") as file:
-                    pickle.dump(paper.text_embedding, file) # list of embeddings
-            else:
-                with open(f"data/embeddings/{paper.index}.pt", "rb") as file:
-                    paper.text_embedding = pickle.load(file) # list of embeddings
+            if paper.unavailable == False:
+                if paper.embedding_created == False:
+                    print(">>> Embedding created")
+                    paper.get_text_embedding(self.model)
+                    with open(f"data/embeddings/{paper.title}.pt", "wb") as file:
+                        pickle.dump(paper.text_embedding, file) # list of embeddings
+                else:
+                    print(">>> Embedding already created")
+                    with open(f"data/embeddings/{paper.title}.pt", "rb") as file:
+                        paper.text_embedding = pickle.load(file) # list of embeddings
+
         self.papers = processed_papers
 
     def insert_papers(self, n_trees):
@@ -376,15 +375,21 @@ class PaperCollection:
         print("Building index took", round(time.time() - start, 2),
               "seconds based on", n_trees, "trees")
         print(f"Answering your questions based on the {len(self.papers)} papers "
-              "that are closest to your selected topics.")
+               "that are closest to your selected topics.")
 
     def query(self, query: str, n_results=10):
         query_embedding = self.model.encode(query).tolist()
+        # This index iterates over all sentences of the papers appended
         top_idx = self.annoy.get_nns_by_vector(query_embedding, n_results)
+        # Take into account context
+        top_idx = [[i-2, i-1, i, i+1, i+2] for i in top_idx]
+        top_idx = [i for j in top_idx for i in j]
         # Problem: if you do it like this they lose their ordering
         sentences = [i.text for i in self.papers]
         sentences_unnested = [i for j in sentences for i in j]
         top_sentences = [sentences_unnested[i] for i in top_idx]
+        # Delete duplicates
+        top_sentences = list(dict.fromkeys(top_sentences))
         return top_sentences
 
 
@@ -438,11 +443,10 @@ class PaperPal():
     """
     This the chatbot class.
     """
-    def __init__(self, topics: str):
+    def __init__(self, topics: str, file_paths: List[str]):
         # Scrape the data file
         self.scraper = WebOfScienceScraper()
-        self.scraper.read_tdf(["data/savedrecs_1_RFM.txt", "data/savedrecs_2_RFM.txt"],
-                          top_n=5000)
+        self.scraper.read_tdf(file_paths=file_paths, top_n=5000)
         self.papers = self.scraper.generate_papers()
 
         # Create embeddings and store them in annoy
@@ -456,12 +460,14 @@ class PaperPal():
         # TODO: implement positive and negative queries and examples to select
         # top papers.
         # TODO: add the paper index as the source => relate this to the first author and publication date
-        # TODO: make text sentences overlapping
-        top_papers = self.abstract_collection.query(topics, n_results=100)
-        print(top_papers)
+        # TODO: don't make the sentences of the article text overlapping, but
+        # get the previous and next sentences of the text
+        # TODO: make it so that actually 100 papers are returned, and not 100
+        # are tested
+        top_papers = self.abstract_collection.query(topics, n_results=300)
 
         # Get the pdf and full text of the top papers
-        self.paper_collection = PaperCollection(top_papers, n_trees=20000)
+        self.paper_collection = PaperCollection(top_papers, n_trees=10000)
 
     def chat(self):
         # response = self._summarize_sentences(user_input, top_sentences)
@@ -471,7 +477,7 @@ class PaperPal():
         memory = ConversationBufferWindowMemory(k=5, input_key="input",
                                                 memory_key="history")
         chain = LLMChain(llm=OpenAI(temperature=0), prompt=prompt, memory=memory,
-                         verbose=False)
+                         verbose=True)
         print("Hello! I am PaperPal. I can help you explore the literature on a "
               "topic of your choice. Type your question below or 'quit' to exit.")
         while True:
@@ -479,14 +485,15 @@ class PaperPal():
             if user_input == "quit":
                 break
             else:
-                top_sentences = self.paper_collection.query(user_input, n_results=30)
-                top_sentences = " ".join(top_sentences)
+                top_sentences = self.paper_collection.query(user_input, n_results=20)
+                top_sentences = " \n".join(top_sentences)
                 output = chain.predict(text=top_sentences, input=user_input)
                 print(output)
 
 
 def main():
-    paper_pal = PaperPal(topics="Recency, frequency, monetary")
+    paper_pal = PaperPal(topics="Recency, frequency, monetary",
+                         file_paths=["data/savedrecs_1_RFM.txt", "data/savedrecs_2_RFM.txt"])
     paper_pal.chat()
 
 
