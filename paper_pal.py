@@ -1,26 +1,3 @@
-# Idea: chat with an export of WOS
-
-# read the csv
-
-# generate a paper instance for each row
-
-# generate an embedding for each paper
-
-# upload the embeddings to chroma
-
-# generate a similary measure between the search and query embedding
-
-# optional: add a penalty for papers that are dissimilar to a group of papers
-# that are similar. To do this, select a few papers a priori that are wanted
-# and some that are unwanted. Train a model to predict whether a paper is
-# wanted or unwanted. Classify all papers. If the paper is unwanted, add a
-# penalty.
-
-# Return the top N papers that are most similar to the search query
-
-# Then do something else on the papers like a summary?
-
-import selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromiumService
 from webdriver_manager.chrome import ChromeDriverManager
@@ -32,6 +9,7 @@ from langchain import OpenAI, LLMChain, PromptTemplate
 from langchain.memory import ConversationBufferWindowMemory
 from util import paper_pal_template
 
+import argparse
 import os
 import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -40,6 +18,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import numpy as np
 import PyPDF2
+from sklearn.metrics.pairwise import cosine_similarity
 import re
 import pickle
 import nltk
@@ -76,6 +55,19 @@ class WebOfSciencePaper:
         for sentence in self.text:
             self.text_embedding.append(model.encode(sentence).tolist())
 
+    def create_or_load_annoy(self, n_trees_per_sentence):
+        annoy_files = [i.replace(".ann", "") for i in os.listdir("data/annoy_files")]
+        self.annoy = annoy.AnnoyIndex(768, "angular")
+        if not self.unavailable:
+            n_trees = n_trees_per_sentence * len(self.text)
+            if self.title not in annoy_files:
+                for idx, vector in enumerate(self.text_embedding):
+                    self.annoy.add_item(idx, vector)
+                self.annoy.build(n_trees)
+                self.annoy.save(f"data/annoy_files/{self.title}.ann")
+            else:
+                self.annoy.load(f"data/annoy_files/{self.title}.ann")
+
     def _init_driver(self):
         # I have to reconstruct the driver for every paper, because of some
         # obscure and haunted bug. :(
@@ -105,10 +97,10 @@ class WebOfSciencePaper:
         base_url = "https://sci-hub.ru/"
         driver.get(base_url)
         # Wait until button becomes visible
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        btn = WebDriverWait(driver, 10)\
-                .until(EC.presence_of_element_located((By.ID, "request")))
+        # from selenium.webdriver.support.ui import WebDriverWait
+        # from selenium.webdriver.support import expected_conditions as EC
+        # btn = WebDriverWait(driver, 10)\
+        #         .until(EC.presence_of_element_located((By.ID, "request")))
         # Search for the paper
         search_target = self.doi if self.doi!="" else self.title
         search_inputs = driver.find_elements(By.ID, "request")
@@ -142,12 +134,14 @@ class WebOfSciencePaper:
         #     self.pdf_available = False
         #     raise PaperNotFoundException
 
+        # Take a screenshot
+        driver.save_screenshot("screenshot.png")
+
         # If there is no button, sci-hub does not have this paper and did not
         # return a page with a pdf
         result = soup.find_all('button')
         if len(result) == 0:
             driver.quit()
-            # self.pdf_available = False 
             raise PaperNotFoundException
 
         # If there is a button, sci-hub has the paper and we download the pdf
@@ -164,38 +158,34 @@ class WebOfSciencePaper:
             response = requests.get(link, verify=False) # Yes, I know
             driver.quit()
             if response.status_code == 200:
-                with open(f"pdf_files/{self.title}.pdf", "wb") as file:
+                with open(f"data/pdf_files/{self.title}.pdf", "wb") as file:
                     file.write(response.content)
                     driver.quit()
-                    # self.pdf_available = True
                     return
             # This is in the case of a 404 error, even if we found the link
             else:
                 driver.quit()
-                # self.pdf_available = False
                 raise PaperNotFoundException
 
         driver.quit()
-        # self.pdf_available = False
         raise PaperNotFoundException
 
     def get_pdf(self):
         """Try to find the pdf in the pdf_files folder. If it is not there,
            scrape sci-hub and raise an exception if it is not available."""
         # If the pdf has already been downloaded, get that
-        pdf_files = os.listdir("pdf_files")
+        pdf_files = os.listdir("data/pdf_files")
         pdf_files = [i.replace(".pdf", "") for i in pdf_files]
+
         if self.title in pdf_files:
-            # self.pdf_available = True
             pass
-        # If not, scrape sci-hub
-        else:
+        if self.title not in pdf_files:
             self._scrape_pdf()
 
     def process_pdf(self):
         """Read the pdf and extract the text."""
         # reader = PyPDF2.PdfReader(BytesIO(self.pdf))
-        reader = PyPDF2.PdfReader(open(f"pdf_files/{self.title}.pdf", "rb"))
+        reader = PyPDF2.PdfReader(open(f"data/pdf_files/{self.title}.pdf", "rb"))
         pdf_text = [reader.pages[i].extract_text() for i in range(len(reader.pages))]
         pdf_text = "".join(pdf_text)
         pdf_text = re.sub("\s+", " ", pdf_text)
@@ -207,9 +197,7 @@ class WebOfSciencePaper:
                            .decode("ascii")
 
         # If the text is empty, raise a PaperNotFoundException
-        if len(pdf_text) < 100:
-            # self.pdf_available = False
-            raise PaperNotFoundException
+        if len(pdf_text) < 100: raise PaperNotFoundException
 
         # Delete the references section
         if "references" in pdf_text.lower():
@@ -217,19 +205,13 @@ class WebOfSciencePaper:
             pdf_text = pdf_text[:references_index]
 
         sentences = nltk.tokenize.sent_tokenize(pdf_text)
-
-        # Merge short sentences with the previous sentence
-        for idx in range(1, len(sentences)):
-            if len(sentences[idx]) < 20:
-                sentences[idx-1] += sentences[idx]
-                sentences[idx] = ""
-        sentences = [i for i in sentences if i != ""]
+        sentences = [i for i in sentences if len(i) > 30]
+        sentences = [i for i in sentences if i != None]
         sentences = [i for i in sentences if "keywords" not in i.lower()]
         sentences = [i for i in sentences if "arxiv" not in i.lower()]
         # Remove all sentences with a link in them
         sentences = [i for i in sentences if not bool(re.search(r'https?://\S+|www\.\S+', i))]
-        # Delete short sentences
-        sentences = [i for i in sentences if len(i) > 5]
+
         self.text = sentences
 
     def process_abstract(self):
@@ -242,9 +224,6 @@ class PaperNotFoundException(Exception):
     def __init__(self):
         pass
 
-class DDOSCheckException(Exception):
-    def __init__(self):
-        pass
 
 class WebOfScienceScraper:
     """
@@ -288,6 +267,9 @@ class WebOfScienceScraper:
             if len(data[i][0]) > 200:
                 data[i][0] = data[i][0][:200]
 
+        data = [i for i in data if i[0] != "A comparison between Fuzzy Linguistic RFM Model and traditional RFM model applied to Campaign Management. Case study of retail business."]
+        data = [i for i in data if i[0] != "Predicting Customer Profitability Dynamically over Time: An Experimental Comparative Study"]
+
         # Make a dict out of each row of data
         data[0] = [wos_category_names[i] for i in data[0]]
         data = [dict(zip(data[0], i)) for i in data[1:]]
@@ -303,197 +285,154 @@ class WebOfScienceScraper:
         # Construct the papers
         papers = [WebOfSciencePaper(title=i["title"], abstract=i["abstract"],
                                     doi=i["DOI"]) for i in self.data]
-        # Create an index that maps back to the title
-        idx = list(range(len(self.data)))
-        idx_to_title = dict(zip(idx, [i["title"] for i in self.data]))
-        # Save this function
-        with open("data/idx_to_title.pt", "wb") as file:
-            pickle.dump(idx_to_title, file)
-        # Add the index to the papers
-        for index, paper in zip(idx, papers):
-            paper.index = index
         # Delete duplicates
         papers = self._delete_duplicates(papers)
         return papers
 
 
 class PaperCollection:
-    def __init__(self, papers: List[WebOfSciencePaper], n_trees):
+    def __init__(self, papers: List[WebOfSciencePaper]):
         self.papers = papers
         self.model = SentenceTransformer("all-mpnet-base-v2")
-        self.process_papers()
-        self.insert_papers(n_trees=n_trees)
+        self._process_papers()
 
-    def process_papers(self):
-        unavailable_titles = open("data/unavailable_titles.txt", "r").readlines()
-        unavailable_titles = [i.replace("\n", "") for i in unavailable_titles]
-        embedding_files = [i.replace(".pt", "") for i in os.listdir("data/embeddings/")]
-        print("Embedding files:", embedding_files)
-        # Make papers into a nested list of chunks
+    def _process_papers(self):
         processed_papers = []
+        saved_papers = [i.replace(".pt", "") for i in os.listdir("data/papers/")]
 
-        for paper in tqdm(self.papers, desc="Processing PDFs", leave=False):
-            paper.unavailable = True if paper.title in unavailable_titles else False
-            paper.embedding_created = True if paper.title in embedding_files else False
-            if paper.unavailable == False:
-                if paper.embedding_created == False:
-                    print(">>> Loading paper")
-                    try:
-                        paper.get_pdf()
-                        paper.process_pdf()
-                    except PaperNotFoundException:
-                        print("PaperNotFoundException")
-                        print(paper.title)
-                        with open("data/unavailable_titles.txt", "a") as file:
-                            file.write(paper.title + "\n")
-            processed_papers.append(paper)
-
-        for paper in tqdm(processed_papers, desc="Creating embeddings", leave=False):
-            if paper.unavailable == False:
-                if paper.embedding_created == False:
-                    print(">>> Embedding created")
+        for paper in tqdm(self.papers, desc="Processing papers" ,leave=False):
+            if paper.title in saved_papers:
+                paper = pickle.load(open(f"data/papers/{paper.title}.pt", "rb"))
+            else:
+                try:
+                    paper.get_pdf()
+                    paper.process_pdf()
                     paper.get_text_embedding(self.model)
-                    with open(f"data/embeddings/{paper.title}.pt", "wb") as file:
-                        pickle.dump(paper.text_embedding, file) # list of embeddings
-                else:
-                    print(">>> Embedding already created")
-                    with open(f"data/embeddings/{paper.title}.pt", "rb") as file:
-                        paper.text_embedding = pickle.load(file) # list of embeddings
+                    paper.unavailable = False
+                except PaperNotFoundException:
+                    with open("data/unavailable_titles.txt", "a") as file:
+                        file.write(paper.title + "\n")
+                    paper.unavailable = True 
+
+                with open(f"data/papers/{paper.title}.pt", "wb") as file:
+                    pickle.dump(paper, file)
+
+            processed_papers.append(paper)
 
         self.papers = processed_papers
 
-    def insert_papers(self, n_trees):
-        self.annoy = annoy.AnnoyIndex(768, 'angular')
-        idx = 0
-        for paper in tqdm(self.papers, desc="Inserting papers", leave=False):
-            for embedding in paper.text_embedding:
-                self.annoy.add_item(idx, embedding); idx += 1;
-        import time; start = time.time()
-        print("Building text collection index...", end="\r")
-        self.annoy.build(n_trees)
-        print("Number of vectors in text collection index:", self.annoy.get_n_items())
-        print("Building index took", round(time.time() - start, 2),
-              "seconds based on", n_trees, "trees")
-        print(f"Answering your questions based on the {len(self.papers)} papers "
-               "that are closest to your selected topics.")
-
     def query(self, query: str, n_results=10):
+        """Returns the most similar sentences in the collection of the query."""
         query_embedding = self.model.encode(query).tolist()
-        # This index iterates over all sentences of the papers appended
-        top_idx = self.annoy.get_nns_by_vector(query_embedding, n_results)
-        # Take into account context
-        top_idx = [[i-2, i-1, i, i+1, i+2] for i in top_idx]
-        top_idx = [i for j in top_idx for i in j]
-        # Problem: if you do it like this they lose their ordering
-        sentences = [i.text for i in self.papers]
-        sentences_unnested = [i for j in sentences for i in j]
-        top_sentences = [sentences_unnested[i] for i in top_idx]
-        # Delete duplicates
-        top_sentences = list(dict.fromkeys(top_sentences))
-        return top_sentences
 
-
-class AbstractCollection:
-    def __init__(self, papers: List[WebOfSciencePaper], reload: bool, n_trees: int):
-        self.model = SentenceTransformer("all-mpnet-base-v2")
-        self.papers = papers
-        # Load index
-        self.annoy = annoy.AnnoyIndex(768, 'angular')
-        if not reload: self.annoy.load("data/abstracts.ann")
-        # Load mapping from index to title
-        self.idx_to_title = pickle.load(open("data/idx_to_title.pt", "rb"))
-        if reload: self._insert_abstracts(papers, n_trees=n_trees)
-        print("Number of vectors in abstract index:", self.annoy.get_n_items())
-        # Save annoy index
-        self.annoy.save("data/abstracts.ann")
-
-    def _insert_abstracts(self, papers: List[WebOfSciencePaper], n_trees):
-        self.titles = []
-        for paper in tqdm(papers, desc="Generating abstract embeddings", leave=False):
-            paper.get_abstract_embedding(self.model)
-            self.titles.extend([paper.title] * len(paper.abstract_embedding))
-
-        abstract_idx = 0
-        for paper in papers:
-            for embedding in paper.abstract_embedding:
-                self.annoy.add_item(abstract_idx, embedding); abstract_idx += 1;
-
-        import time; start = time.time()
-        self.annoy.build(n_trees)
-        print("Building abstract index took", time.time() - start,
-              "seconds based on", n_trees)
-
-    def query(self, query: str, n_results=10) -> List[WebOfSciencePaper]:
-        """Returns the top N most similar papers to the query."""
-        query_embedding = self.model.encode(query).tolist()
-        top_idx = self.annoy.get_nns_by_vector(query_embedding, n_results)
-
-        idx = 0
-        top_papers = []
+        # Directly query the embedding instead of annoy
+        all_sentences = []
+        all_similarities = []
         for paper in self.papers:
-            for _ in paper.abstract:
-                if idx in top_idx and paper not in top_papers:
-                    top_papers.append(paper)
-                idx += 1
+            if not paper.unavailable:
+                similarities = cosine_similarity(
+                    paper.text_embedding,
+                    [query_embedding]*len(paper.text_embedding)
+                )
+                all_sentences.extend(paper.text)
+                all_similarities.extend(similarities.tolist())
 
-        return top_papers
-
+        # Return the top results
+        # TODO: return a few sentences after the most similar sentence
+        assert len(all_sentences) == len(all_similarities)
+        data = sorted(zip(all_similarities, all_sentences),
+                      key=lambda x: x[0], reverse=True)
+        top_sentences = [i[1] for i in data][:n_results]
+        return top_sentences
 
 class PaperPal():
     """
     This the chatbot class.
     """
-    def __init__(self, topics: str, file_paths: List[str]):
+    def __init__(self, topics: str, file_paths: List[str], n_papers: int):
+        self.topics = topics
+        self.n_papers = n_papers
+        self.model = SentenceTransformer("all-mpnet-base-v2")
         # Scrape the data file
-        self.scraper = WebOfScienceScraper()
-        self.scraper.read_tdf(file_paths=file_paths, top_n=5000)
-        self.papers = self.scraper.generate_papers()
+        top_papers = self.load_papers(file_paths, n=5000)
+        self.paper_collection = PaperCollection(top_papers)
+        print("Number of available papers:",
+              len([i for i in self.paper_collection.papers if not i.unavailable]))
 
-        # Create embeddings and store them in annoy
-        # Set reload=True to generate the abstract embeddings and construct the
-        # annoy index. Thus, only set it equal to true the first time that you run
-        # the code for a certain WoS export.
-        self.abstract_collection = AbstractCollection(self.papers, reload=False, n_trees=20000)
+    def load_papers(self, file_paths: List[str], n: int):
+        scraper = WebOfScienceScraper()
+        scraper.read_tdf(file_paths=file_paths, top_n=n)
+        self.papers = scraper.generate_papers()
+        print("Number of scraped papers from csv files:", len(self.papers))
 
-        # Limit the number of results to n_papers most similar the the query such
-        # that we don't have to scrape too many pdfs
-        # TODO: implement positive and negative queries and examples to select
-        # top papers.
-        # TODO: add the paper index as the source => relate this to the first author and publication date
-        # TODO: don't make the sentences of the article text overlapping, but
-        # get the previous and next sentences of the text
-        # TODO: make it so that actually 100 papers are returned, and not 100
-        # are tested
-        top_papers = self.abstract_collection.query(topics, n_results=300)
+        # For each paper, create its abstract embedding
+        # Check if the paper has been pickled and if so load it
+        pickled_papers = [i.replace(".pt", "") for i in os.listdir("data/papers")]
+        print("Number of pickled papers:", len(pickled_papers))
+        for idx, paper in tqdm(enumerate(self.papers)):
+            if paper.title in pickled_papers:
+                paper = pickle.load(open(f"data/papers/{paper.title}.pt", "rb"))
+                self.papers[idx] = paper
+            if paper.abstract_embedding is None:
+                paper.get_abstract_embedding(self.model)
+                self.papers[idx] = paper
 
-        # Get the pdf and full text of the top papers
-        self.paper_collection = PaperCollection(top_papers, n_trees=10000)
+        print(len(self.papers))
+        self.papers = [i for i in self.papers if len(i.abstract_embedding) > 0]
+        print(len(self.papers))
+
+        # Create the query embedding
+        query_embedding = self.model.encode(self.topics).tolist()
+        # Calculate the angle between them
+        similarities = []
+        for paper in self.papers:
+            similarity = cosine_similarity(paper.abstract_embedding,
+                                           [query_embedding]*len(paper.abstract_embedding))
+            similarities.append(similarity.mean())
+        # Return the most similar papers to the topics
+        data = sorted(zip(similarities, [i.title for i in self.papers]),
+                      key=lambda x: x[0], reverse=True)
+        top_titles = [i[1] for i in data[:self.n_papers]]
+        top_papers = [i for i in self.papers if i.title in top_titles]
+        return top_papers
 
     def chat(self):
-        # response = self._summarize_sentences(user_input, top_sentences)
-        # print(response)
         prompt = PromptTemplate(input_variables=["input", "text", "history"],
                                 template=paper_pal_template)
         memory = ConversationBufferWindowMemory(k=5, input_key="input",
                                                 memory_key="history")
         chain = LLMChain(llm=OpenAI(temperature=0), prompt=prompt, memory=memory,
                          verbose=True)
+
         print("Hello! I am PaperPal. I can help you explore the literature on a "
               "topic of your choice. Type your question below or 'quit' to exit.")
+
         while True:
             user_input = input(">>> ")
             if user_input == "quit":
                 break
             else:
-                top_sentences = self.paper_collection.query(user_input, n_results=20)
+                top_sentences = self.paper_collection.query(user_input, n_results=50)
                 top_sentences = " \n".join(top_sentences)
                 output = chain.predict(text=top_sentences, input=user_input)
                 print(output)
 
 
 def main():
-    paper_pal = PaperPal(topics="Recency, frequency, monetary",
-                         file_paths=["data/savedrecs_1_RFM.txt", "data/savedrecs_2_RFM.txt"])
+    # Add command line arguments
+    parser = argparse.ArgumentParser(description="PaperPal")
+    parser.add_argument("--reset_papers", "--reset_papers", action="store_true", default=False)
+    parser.add_argument("--reset_annoy", "--reset_annoy", action="store_true", default=False)
+    args = parser.parse_args()
+
+    if args.reset_papers:
+        for i in os.listdir("data/papers"): os.remove("data/papers/" + i)
+    if args.reset_annoy:
+        for i in os.listdir("data/annoy_files"): os.remove("data/annoy_files/" + i)
+
+    paper_pal = PaperPal(topics="Recency, frequency, monetary, RFM features",
+                         file_paths=["data/savedrecs_1_RFM.txt", "data/savedrecs_2_RFM.txt"],
+                         n_papers=500)
     paper_pal.chat()
 
 
