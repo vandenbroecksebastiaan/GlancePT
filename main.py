@@ -1,7 +1,5 @@
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromiumService
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import ChromeType
+from selenium.webdriver.chrome.service import Service
 
 from bs4 import BeautifulSoup
 import requests
@@ -20,12 +18,10 @@ import matplotlib.pyplot as plt
 from multiprocessing import Pool
 import textwrap
 from sklearn.cluster import KMeans
-import xmltodict
 
 import openai
 from sentence_transformers import SentenceTransformer, util
 openai.api_key = os.environ["OPENAI_API_KEY"]
-
 
 from email_client import EmailClient
 
@@ -41,14 +37,9 @@ class Scraper:
         options = webdriver.ChromeOptions()
         options.add_argument('--headless')
         options.add_argument("--remote-debugging-port=9222") # do not delete
-        driver = webdriver.Chrome(
-            options=options,
-            service=ChromiumService(
-                ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
-            )
-        )
+        driver = webdriver.Chrome(service=Service(), options=options)
         return driver
-    
+
     def get_papers(self, url: str) -> str:
         self.driver.get(url)
         # Scroll to the bottom of the page until n_papers is reached
@@ -65,10 +56,10 @@ class Scraper:
 
         self.paper_links = [i.split("/")[-1] for i in papers][:self.n_papers]
         return self.driver.page_source
-        
+
     def __len__(self):
         return len(self.paper_links)
-        
+
     def __iter__(self):
         self.index = 0
         return self
@@ -85,8 +76,8 @@ class Scraper:
 class Paper:
     def __init__(self, link):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.link = link
-        paper_info = requests.get(f"https://paperswithcode.com/api/v1/papers/{self.link}")
+        self.link = f"https://paperswithcode.com/api/v1/papers/{link}"
+        paper_info = requests.get(self.link)
         paper_info = paper_info.json()
 
         if "detail" in paper_info.keys():
@@ -162,7 +153,7 @@ class Paper:
         pdf_text = re.sub(r'We ', 'The authors ', pdf_text)
         pdf_text = re.sub(r'we ', 'the authors ', pdf_text)
         pdf_text = re.sub(r'I ', 'the author ', pdf_text)
-        
+
         sentences = nltk.tokenize.sent_tokenize(pdf_text)
         # Merge short sentences with the previous sentence
         for idx in range(1, len(sentences)):
@@ -181,7 +172,7 @@ class Paper:
         sentences = sentences[1:]
         # Make sentences into a non-overlapping sliding window of 3 elements each
         # sentences = [" ".join(sentences[i:i+3]) for i in range(0, len(sentences), 3)]
-        
+
         n_words = len("".join(pdf_text).split(" "))
         n_chars = len("".join(pdf_text))
         print(f">>> There are about {n_words} words and {n_chars} chars in " \
@@ -189,7 +180,7 @@ class Paper:
 
         self.pdf_text = pdf_text
         self.sentences = sentences
-        
+
     def process_abstract(self):
         self.abstract = re.sub(r'\[[^\]]*\]', '', self.abstract)
         self.abstract = re.sub(r'e\.g\.', 'for example', self.abstract)
@@ -224,7 +215,7 @@ class Paper:
                 sentence_dot_scores.append((self.sentences[idx]+self.sentences[next_idx], dot_score))
                 sentence_dot_scores = sorted(sentence_dot_scores, key=lambda x: x[1],
                                              reverse=True)
-            
+
             self.most_important_sentences.extend([i[0] for i in sentence_dot_scores[:n_sentences]])
 
     def get_summary(self):
@@ -245,18 +236,18 @@ Use the third person when referring to the authors of the paper.
 
     def get_clusters(self, n_clusters=1):
         from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=n_clusters, random_state=1337, n_init="auto") \
+        kmeans = KMeans(n_clusters=n_clusters, random_state=1337, n_init=10) \
                      .fit(self.text_embeddings)
         self.clusters = kmeans.labels_
-        self.cluster_centers = kmeans.cluster_centers_   # use this for annotate
-    
+        self.cluster_centers = kmeans.cluster_centers_
+
     def get_closest_sentences(self, top=10):
         # Get the closest sentence to each cluster center
         closest_sentences = []
         for i in range(len(self.cluster_centers)):
             distances = np.linalg.norm(self.text_embeddings - self.cluster_centers[i], axis=1)
             closest_sentences.append(np.argsort(distances)[:top])
-                
+
     def visualize_embedding(self, n_neighbors=10):
         red_embeddings = umap.UMAP(n_neighbors=n_neighbors) \
                              .fit_transform(self.text_embeddings)
@@ -265,11 +256,11 @@ Use the third person when referring to the authors of the paper.
                     c=np.arange(red_embeddings.shape[0]), cmap="viridis")
         plt.colorbar()
         plt.savefig(f"visualizations/{self.title}.png", dpi=300, bbox_inches='tight')
-        
+
 
 class PaperNotFoundException(Exception):
     pass
-              
+
 
 class AbstractVisualization:
     def __init__(self, abstracts: List, paper_titles: List, n_papers: int):
@@ -280,7 +271,7 @@ class AbstractVisualization:
         if self.n_papers > 15: self.n_clusters = self.n_papers // 4
         elif self.n_papers > 9: self.n_clusters = self.n_papers // 3
         else: self.n_clusters = self.n_papers // 2
-        
+
         self._get_embeddings()
         self._cluster_abstracts()
         self._get_cluster_descriptions()
@@ -296,7 +287,7 @@ class AbstractVisualization:
             except openai.error.RateLimitError:
                 print(f"Error in GPT-3 call: Rate limit exceeded. "\
                       f"Trying again... {idx}")
-                
+
     def _get_embeddings(self):
         """Generates embeddings for each sentence in the abstract using
         SentenceTransformer. Then, reduces the dimensionality of the
@@ -331,7 +322,7 @@ class AbstractVisualization:
         cluster_to_abstracts = {k: " ".join(v) for k, v in
                                 cluster_to_abstracts.items()}
         self.cluster_to_abstracts = cluster_to_abstracts
-        
+
         # Create a mapping from cluster_id to cluster center
         self.cluster_to_centroid = {k: v.tolist() for k, v in
                                     enumerate(self.cluster_centers)}
@@ -389,14 +380,14 @@ The abstracts:
         title_to_style = {}
         for idx, title in enumerate(list(set(self.paper_titles))):
             title_to_style[title] = styles[idx]
-            
+
         # Create a list of styles that can be used for plotting
         styles = [[title_to_style[i]] * length for i, length in
                   zip(self.paper_titles, self.abstract_lengths)]
         styles = [i for j in styles for i in j]
-        
+
         return styles
-    
+
     def _prepare_labels(self):
         """Prepares the labesl for the plot."""
         # Create a list of labels that can be used for plotting
@@ -439,7 +430,6 @@ The abstracts:
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
         plt.savefig(f"visualizations/abstracts.png", dpi=300, bbox_inches='tight')
 
-
 def process_paper(link):
     try:
         paper = Paper(link)
@@ -453,31 +443,29 @@ def process_paper(link):
 def main():
     # Get vargs
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_papers", type=int, default=4)
+    parser.add_argument("--n_papers", type=int, default=20)
     parser.add_argument("--email", type=str, required=True)
-    parser.add_argument("--n_processes", type=int, default=8)
     args = parser.parse_args()
-
     n_papers = args.n_papers
     email = args.email
-    n_processes = args.n_processes
 
     # Scrape the site and process the papers
     scraper = Scraper(n_papers=n_papers)
-    with Pool(n_processes) as pool: 
-        papers = pool.map(process_paper, list(scraper))
-        
+    papers = [process_paper(i) for i in scraper]
+
     # Exclude the papers that weren't found using the API
     papers = [i for i in papers if i is not None]
     paper_titles = [i.title for i in papers]
     paper_summaries = [i.summary for i in papers]
+    paper_links = [i.url_pdf for i in papers]
     abstracts = [i.abstract for i in papers]
-    
+
     AbstractVisualization(abstracts, paper_titles, n_papers).visualize_abstracts()
-    
+
     # Send the mail
     email_sender = EmailClient()
-    email_sender.make_email(paper_titles, paper_summaries, email)
+    email_sender.make_email(paper_titles=paper_titles, paper_summaries=paper_summaries,
+                            paper_links=paper_links, recipient_email=email)
     email_sender.send_email()
 
 

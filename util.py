@@ -2,7 +2,7 @@ wos_category_names = {
     # 'FN': 'File Name',
     # 'VR': 'Version Number',
     # 'PT': 'Publication Type (J=Journal; B=Book; S=Series; P=Patent)',
-    # 'AU': 'Authors',
+    'AU': 'Authors',
     # 'AF': 'Author Full Name',
     # 'BA': 'Book Authors',
     # 'BF': 'Book Authors Full Name',
@@ -45,7 +45,7 @@ wos_category_names = {
     # 'J9': '29-Character Source Abbreviation',
     # 'JI': 'ISO Source Abbreviation',
     # 'PD': 'Publication Date',
-    # 'PY': 'Year Published',
+    'PY': 'Year Published',
     # 'VL': 'Volume',
     # 'IS': 'Issue',
     # 'SI': 'Special Issue',
@@ -75,10 +75,8 @@ wos_category_names = {
 }
 
 paper_pal_template = """PaperPal is a large language model trained by OpenAI.
-PaperPal is designed to answer questions from a TEXT and provide accurate and in-depth responses.
-As a language model, PaperPal is able to generate human-like text based on the input it receives, allowing it to engage in natural-sounding conversations and provide responses that are coherent and relevant to the topic at hand.
-If you do not know an answer, say that you don't know and don't try to guess or make up an answer.
-If you don't have enough information in the TEXT to answer a question, you can ask for more information.
+PaperPal is designed to analyse a TEXT and answer questions about it that were proposed by the human.
+It does so by making a summary of it that is tailored to the human's question.
 
 TEXT: {text}
 
